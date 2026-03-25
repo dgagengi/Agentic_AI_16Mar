@@ -1,0 +1,217 @@
+# financial bot designed using langcian, langgraph and groq
+# Install dependencies
+!pip -q install langgraph langchain langchain-groq
+
+# Imports
+import os
+import re
+import json
+from typing import TypedDict, Optional, Dict, Any, List
+
+from langgraph.graph import StateGraph
+from langchain_groq import ChatGroq
+from google.colab import userdata
+
+# Set API key from Colab secrets
+os.environ["GROQ_API_KEY"] = userdata.get("GROQ_API_KEY")
+
+# Initialize LLM
+llm = ChatGroq(
+    model_name="llama-3.3-70b-versatile",
+    groq_api_key=os.environ["GROQ_API_KEY"]
+)
+
+# Simple LLM call function
+# takes a prompt as imput, invole will send it to LLM, get response object
+def ask_llm(prompt: str) -> str:
+    response = llm.invoke(prompt)
+    return response.content.strip()
+
+# ============== STATE TYPE =================
+class BotState(TypedDict, total=False):
+    user_input: str
+    intent: Optional[str]        # expense | budget | advice | unknown
+    data: Optional[str]
+    expenses: List[Dict[str, Any]]
+    hitl_flag: bool              # safety flag
+
+# ============== HELPERS ====================
+def parse_amount_and_category(text: str):
+    clean = text.replace(",", "")
+    amt = None
+    m_amt = re.search(r"(\d+(\.\d+)?)", clean)
+    
+    if m_amt:
+      amt = float(m_amt.group(1))
+
+    t = text.lower()
+    cat = "general"
+    if "grocery" in t or "grocer" in t: 
+        cat = "groceries"
+    elif "rent" in t: 
+        cat = "rent"
+    elif "travel" in t or "flight" in t: 
+        cat = "travel"
+
+    return amt, cat
+
+
+def is_high_risk(t1: str) -> bool:
+    risky_keywords = [
+        "retirement", "liquidate", "loan against", "pledge", "sell house",
+        "quit job", "all-in", "bet everything", "margin", "mortgage my",
+        "crypto all", "withdraw provident fund", "pf withdraw"
+    ]
+    return any(k in t1 for k in risky_keywords)
+
+# ============== NODES ======================
+# normalize output
+def node_intent(state: BotState) -> BotState:
+    text = state.get("user_input", "")
+    t1 = text.lower().strip()
+
+    # 1) Safety check first
+    state["hitl_flag"] = is_high_risk(t1)
+
+    # 2) Keyword routing first (deterministic)
+    if any(k in t1 for k in ["budget", "summary", "total spend", "how much spent"]):
+        intent = "budget"
+    elif any(k in t1 for k in ["add ", "spent", "expense", "spend", "rs", "inr", "$"]):
+        intent = "expense"
+    elif any(k in t1 for k in ["advice", "suggest", "tip", "plan", "how do i", "save for"]):
+        intent = "advice"
+    else:
+        # 3) LLM fallback (one word only)
+        prompt = f"""
+Return exactly one word from: [expense, budget, advice, unknown]
+User: "{text}"
+
+Answer with one word only.
+"""
+
+        guess = ask_llm(prompt).lower()
+        intent = guess if guess in ["expense", "budget", "advice"] else "unknown"
+
+    state["intent"] = intent
+    state["data"] = f"(intent={intent}, hitl={state['hitl_flag']})"
+    return state
+
+
+def node_expense(state: BotState) -> BotState:
+    amt, cat = parse_amount_and_category(state["user_input"])
+    if amt is None:
+        state["data"] = "Please say an amount, e.g., 'Add 50 groceries'."
+        return state
+
+    state.setdefault("expenses", []).append({"amount": amt, "category": cat})
+    state["data"] = f"✅ Added expense: {amt} for {cat}."
+    return state
+
+def node_budget(state: BotState) -> BotState:
+    exps = state.get("expenses", [])
+    total = sum(e["amount"] for e in exps) if exps else 0
+
+    by_cat: Dict[str, float] = {}
+    for e in exps:
+        by_cat[e["category"]] = by_cat.get(e["category"], 0) + e["amount"]
+
+    state["data"] = json.dumps(
+        {"total_spent": total, "by_category": by_cat},
+        ensure_ascii=False
+    )
+    return state
+
+
+def node_advice(state: BotState) -> BotState:
+    text = state["user_input"]
+
+    prompt = f"""
+Give exactly 3 short, friendly money tips for this request (no jargon, numbered 1-3):
+User: "{text}"
+"""
+
+    state["data"] = ask_llm(prompt)
+    return state
+
+
+def node_hitl(state: BotState) -> BotState:
+    state["data"] = (
+        "⚠️ This looks high-risk. Please consult a certified financial advisor before acting. "
+    )
+    return state
+
+def node_fallback(state: BotState) -> BotState:
+    state["data"] = "I can help with: expenses (e.g., 'Add 50 groceries'), budget, and advice."
+    return state
+
+
+# ============== ROUTER ======================
+def choose_next(state: BotState) -> str:
+    if state.get("hitl_flag"):
+        return "hitl"
+
+    intent = state.get("intent", "unknown")
+
+    if intent == "expense":
+        return "expense"
+    if intent == "budget":
+        return "budget"
+    if intent == "advice":
+        return "advice"
+
+    return "fallback"
+
+
+# ============== BUILD GRAPH =================
+builder = StateGraph(BotState)
+
+builder.add_node("Intent", node_intent)
+builder.add_node("expense", node_expense)
+builder.add_node("budget", node_budget)
+builder.add_node("advice", node_advice)
+builder.add_node("hitl", node_hitl)
+builder.add_node("fallback", node_fallback)
+
+builder.set_entry_point("Intent")
+
+builder.add_conditional_edges(
+    "Intent",
+    choose_next,
+    {
+        "hitl": "hitl",
+        "expense": "expense",
+        "budget": "budget",
+        "advice": "advice",
+        "fallback": "fallback",
+    },
+)
+
+graph = builder.compile()
+
+# ============== INTERACTIVE CHAT LOOP ==============
+def run_chat():
+    print("Personal Finance Bot (type 'exit' to quit)")
+
+    state: BotState = {
+        "expenses": [],
+        "hitl_flag": False
+    }
+
+    while True:
+        msg = input("You: ").strip()
+
+        if msg.lower() in ("exit", "quit"):
+            print("Bot: Bye! 👋")
+            break
+
+        state["user_input"] = msg
+
+        out = graph.invoke(state)
+
+        print("Bot:", out.get("data", ""))
+
+        # keep returning updated state
+        state = out
+
+
+run_chat()
