@@ -1,0 +1,182 @@
+import os
+import pandas as pd
+import streamlit as st
+from PyPDF2 import PdfReader
+from phi.agent import Agent
+from pinecone import Pinecone, ServerlessSpec
+from phi.tools import tool
+from phi.model.google import Gemini
+from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Initialize Pinecone
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+#### INITIALIZE PINECONE VECTOR STORE
+
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index_name = "data-insights"
+
+if index_name not in pc.list_indexes().names():
+    pc.create_index(
+        name=index_name,
+        dimension=384,  # Dimension of the embeddings from SentenceTransformer
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+    )   
+
+index = pc.Index(index_name)
+
+######call LLM model#####
+model = Gemini(api_key=GOOGLE_API_KEY,id="gemini-pro-latest")
+
+###########call embedding model#####
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+### call function to extract text from csv
+
+def describe_data_fn(filepath: str) -> str:
+    df = pd.read_csv(filepath) if filepath.endswith('.csv') else pd.read_excel(filepath)
+    return df.describe().to_string()
+
+### call function to extract text from csv
+
+def embed_and_store_fn(filepath: str) -> str:
+    df = pd.read_csv(filepath) if filepath.endswith('.csv') else pd.read_excel(filepath)
+    text_data = df.to_csv(index=False)  # Convert DataFrame to CSV string without index
+    chunks = [text_data[i:i+1000] for i in range(0, len(text_data), 1000)]  # Split into chunks of 1000 characters
+
+    vectors=[]
+    for i, chunk in enumerate(chunks):
+        embedding = embedding_model.encode(chunk).tolist()  # Get embedding for the chunk
+        vectors.append((f"{filepath}_{i}", embedding))  # Create a tuple of (id, embedding)
+
+
+    index.upsert(vectors=vectors)
+    return f"stored {len(vectors)} chunks in vector store"
+
+## def search function to query the vector store
+def search_similar_fn(query: str) -> str:
+    query_embedding = embedding_model.encode(query).tolist()
+    results = index.query(vector=query_embedding, top_k=5)
+
+    matches = [
+        f"{m['id']} (score: {m['score']:.2f})"
+        for m in results['matches']
+    ]
+    return "\n".join(matches)
+
+### initialize agent with tools
+
+describe_data = tool(describe_data_fn)
+embed_and_store = tool(embed_and_store_fn)
+search_similar = tool(search_similar_fn)
+
+##### create agent
+
+agent = Agent(
+    tools=[
+        describe_data,
+        embed_and_store,
+        search_similar
+    ],
+    model=model,
+    name="Data analyst Agent",
+    description="""
+    You are an expert data analyst.
+    
+    Always:
+    - Analyze datasets
+    - Identify trends and patterns
+    - Provide insights and recommendations based on the data
+    - Detect anomalies and outliers in the data
+    """
+)
+
+###### Streamlit UI
+st.set_page_config(page_title="Data Insights Agent", layout="wide")
+st.title("Data Insights Agent")
+
+uploaded_file = st.file_uploader(
+    "Upload a CSV or Excel file", 
+    type=["csv", "xlsx", "xls", "pdf"]
+    )
+
+if uploaded_file is not None:
+    try:
+        file_type = uploaded_file.name.split('.')[-1]
+
+        #######csv
+        if file_type == "csv":
+            df = pd.read_csv(uploaded_file)
+            st.success("File uploaded successfully!")
+            st.dataframe(df.head())
+
+        #######excel
+        elif file_type in ["xlsx", "xls"]:
+            df = pd.read_excel(uploaded_file)
+            st.success("File uploaded successfully!")
+            st.dataframe(df.head())
+
+        #######pdf
+        elif file_type == "pdf":
+            reader = PdfReader(uploaded_file)
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text()
+            st.success("File uploaded successfully!")
+            st.text_area("Extracted Text", text, height=300)
+
+            st.subheader("AI analysis")
+            response = agent.run(f"Analyze the following data and provide insights: {text}")
+            st.write(response)
+            st.stop()
+        else:
+            st.error("Unsupported file type. Please upload a CSV, Excel, or PDF file.")
+            st.stop()
+
+    ### save temop file
+        temp_path = f"temp_data.{file_type}"
+        with open(temp_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+    ### basic stats
+        st.subheader("Basic Statistics")
+        st.dataframe(df.describe())
+
+    ### store into vector store
+        st.subheader("Storing in Vector Store")
+        store_msg = embed_and_store_fn(temp_path)
+        st.success(store_msg)
+
+    ### verify vector search
+        st.subheader("Search Similar Data")
+        search_result = search_similar_fn("What are the trends in the data?")
+        st.text(search_result)
+
+    ### AI analysis
+        st.subheader("AI Analysis")
+
+        with st.spinner("Analyzing data with AI..."):
+            response = agent.run(
+                f"""
+                Analyze the dataset in {temp_path}
+
+                Provide:
+                - Key Insights and trends
+                - Anomalies or outliers
+                - Important Columns
+                - Recommendations based on the data
+                """
+            )
+
+        st.write(response)
+
+    except Exception as e:
+        st.error(f"Error processing file: {e}")
